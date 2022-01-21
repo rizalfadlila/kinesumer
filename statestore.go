@@ -17,7 +17,6 @@ var (
 )
 
 type (
-	// StateStore is a distributed key-value store for managing states.
 	StateStore interface {
 		GetShards(ctx context.Context, stream string) (Shards, error)
 		UpdateShards(ctx context.Context, stream string, shards Shards) error
@@ -35,7 +34,7 @@ type (
 		table  *dynamo.Table
 	}
 
-	// stateStore implements the StateStore with AWS DynamoDB. (default)
+	// stateStore is a distributed key-value store for managing states.
 	stateStore struct {
 		app string
 		db  *db
