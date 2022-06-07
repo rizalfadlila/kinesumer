@@ -1,6 +1,7 @@
 package kinesumer
 
 import (
+	"context"
 	"sort"
 	"testing"
 	"time"
@@ -8,8 +9,10 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kinesis"
-	"github.com/daangn/kinesumer/pkg/collection"
 	"github.com/guregu/dynamo"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/daangn/kinesumer/pkg/collection"
 )
 
 type testEnv struct {
@@ -305,6 +308,89 @@ func TestShardsRebalancing(t *testing.T) {
 			t.Errorf(
 				"expected %v, got %v", expected, shardIDs,
 			)
+		}
+	}
+}
+
+func TestKinesumerMarkRecord(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.cleanUp(t)
+
+	streams := []string{"events"}
+	_, err := env.client1.Consume(streams)
+	if err != nil {
+		t.Errorf("expected no errors, got %v", err)
+	}
+
+	expectedSeqNum := "12345"
+	shardIDs := env.client1.shards["events"].ids()
+	for _, shardID := range shardIDs {
+		env.client1.MarkRecord(&Record{
+			Stream:  "events",
+			ShardID: shardID,
+			Record: &kinesis.Record{
+				SequenceNumber: &expectedSeqNum,
+			},
+		})
+	}
+
+	for _, shardID := range shardIDs {
+		resultSeqNum, ok := env.client1.offsets["events"].Load(shardID)
+		if ok {
+			assert.EqualValues(t, expectedSeqNum, resultSeqNum, "they should be equal")
+		} else {
+			t.Errorf("expected %v, got %v", expectedSeqNum, resultSeqNum)
+		}
+	}
+}
+
+func TestKinesumerCommit(t *testing.T) {
+	env := newTestEnv(t)
+	defer env.cleanUp(t)
+
+	streams := []string{"events"}
+	_, err := env.client1.Consume(streams)
+	if err != nil {
+		t.Errorf("expected no errors, got %v", err)
+	}
+	_, err = env.client2.Consume(streams)
+	if err != nil {
+		t.Errorf("expected no errors, got %v", err)
+	}
+	_, err = env.client3.Consume(streams)
+	if err != nil {
+		t.Errorf("expected no errors, got %v", err)
+	}
+
+	clients := map[string]*Kinesumer{
+		env.client1.id: env.client1,
+		env.client2.id: env.client2,
+		env.client3.id: env.client3,
+	}
+
+	expectedSeqNum := "12345"
+	for _, client := range clients {
+		shardIDs := client.shards["events"].ids()
+		for _, shardID := range shardIDs {
+			env.client1.MarkRecord(&Record{
+				Stream:  "events",
+				ShardID: shardID,
+				Record: &kinesis.Record{
+					SequenceNumber: &expectedSeqNum,
+				},
+			})
+		}
+	}
+
+	for _, client := range clients {
+		client.Commit()
+	}
+
+	for _, client := range clients {
+		shardIDs := client.shards["events"].ids()
+		checkpoints, _ := client.stateStore.ListCheckPoints(context.Background(), "events", shardIDs)
+		for _, checkpoint := range checkpoints {
+			assert.EqualValues(t, expectedSeqNum, checkpoint, "sequence number should be equal")
 		}
 	}
 }
