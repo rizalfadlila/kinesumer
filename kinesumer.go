@@ -33,6 +33,8 @@ const (
 	recordsChanBuffer = 20
 )
 
+type DLQConsumer func(ctx context.Context) (shardID string, record []*kinesis.Record)
+
 // Config defines configs for the Kinesumer client.
 type Config struct {
 	App      string // Application name.
@@ -58,11 +60,13 @@ type Config struct {
 	ScanLimit    int64
 	ScanTimeout  time.Duration
 	ScanInterval time.Duration
+	DLQConsumer  DLQConsumer
 }
 
 // Record represents kinesis.Record with stream name.
 type Record struct {
-	Stream string
+	Stream  string
+	ShardID string
 	*kinesis.Record
 }
 
@@ -138,6 +142,9 @@ type Kinesumer struct {
 	wait  sync.WaitGroup
 	stop  chan struct{}
 	close chan struct{}
+
+	// List of all message failure consume
+	dlqConsumer DLQConsumer
 }
 
 // NewKinesumer initializes and returns a new Kinesumer client.
@@ -228,6 +235,10 @@ func NewKinesumer(cfg *Config) (*Kinesumer, error) {
 
 	if kinesumer.efoMode {
 		kinesumer.efoMeta = make(map[string]*efoMeta)
+	}
+
+	if cfg.DLQConsumer != nil {
+		kinesumer.dlqConsumer = cfg.DLQConsumer
 	}
 
 	if err := kinesumer.init(); err != nil {
@@ -518,6 +529,7 @@ func (k *Kinesumer) consumePolling() {
 		for _, shard := range shardsPerStream {
 			k.wait.Add(1)
 			go k.consumeLoop(stream, shard)
+			go k.consumeDLQ(stream)
 		}
 	}
 }
@@ -542,6 +554,38 @@ func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
 	}
 }
 
+func (k *Kinesumer) consumeDLQ(stream string) {
+	defer k.wait.Done()
+
+	// ticker := time.NewTicker(k.scanInterval)
+
+	for {
+		select {
+		case <-k.stop:
+			return
+		case <-k.close:
+			return
+		default:
+			time.Sleep(k.scanInterval)
+			k.consumeBySequenceNumber(stream)
+		}
+	}
+}
+
+func (k *Kinesumer) consumeBySequenceNumber(stream string) {
+	ctx := context.Background()
+
+	shardID, records := k.dlqConsumer(ctx)
+
+	for _, record := range records {
+		k.records <- &Record{
+			Stream:  stream,
+			ShardID: shardID,
+			Record:  record,
+		}
+	}
+}
+
 // It returns a flag whether if shard is CLOSED state and has no remaining data.
 func (k *Kinesumer) consumeOnce(stream string, shard *Shard) bool {
 	ctx := context.Background()
@@ -559,6 +603,7 @@ func (k *Kinesumer) consumeOnce(stream string, shard *Shard) bool {
 		Limit:         aws.Int64(k.scanLimit),
 		ShardIterator: shardIter,
 	})
+
 	if err != nil {
 		k.errors <- errors.WithStack(err)
 		var riue *kinesis.ResourceInUseException
@@ -582,8 +627,9 @@ func (k *Kinesumer) consumeOnce(stream string, shard *Shard) bool {
 	var lastSequence string
 	for i, record := range output.Records {
 		k.records <- &Record{
-			Stream: stream,
-			Record: record,
+			Stream:  stream,
+			ShardID: shard.ID,
+			Record:  record,
 		}
 		if i == n-1 {
 			lastSequence = *record.SequenceNumber
