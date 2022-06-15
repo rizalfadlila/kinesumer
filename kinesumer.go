@@ -33,7 +33,14 @@ const (
 	recordsChanBuffer = 20
 )
 
-type DLQConsumer func(ctx context.Context) (shardID string, record []*kinesis.Record)
+type (
+	DLQRecord struct {
+		ShardID        string
+		SequenceNumber string
+	}
+
+	GetDLQRecord func(ctx context.Context) ([]DLQRecord, error)
+)
 
 // Config defines configs for the Kinesumer client.
 type Config struct {
@@ -60,7 +67,7 @@ type Config struct {
 	ScanLimit    int64
 	ScanTimeout  time.Duration
 	ScanInterval time.Duration
-	DLQConsumer  DLQConsumer
+	GetDLQRecord GetDLQRecord
 }
 
 // Record represents kinesis.Record with stream name.
@@ -144,7 +151,7 @@ type Kinesumer struct {
 	close chan struct{}
 
 	// List of all message failure consume
-	dlqConsumer DLQConsumer
+	getDLQRecord GetDLQRecord
 }
 
 // NewKinesumer initializes and returns a new Kinesumer client.
@@ -237,8 +244,8 @@ func NewKinesumer(cfg *Config) (*Kinesumer, error) {
 		kinesumer.efoMeta = make(map[string]*efoMeta)
 	}
 
-	if cfg.DLQConsumer != nil {
-		kinesumer.dlqConsumer = cfg.DLQConsumer
+	if cfg.GetDLQRecord != nil {
+		kinesumer.getDLQRecord = cfg.GetDLQRecord
 	}
 
 	if err := kinesumer.init(); err != nil {
@@ -567,21 +574,39 @@ func (k *Kinesumer) consumeDLQ(stream string) {
 			return
 		default:
 			time.Sleep(k.scanInterval)
-			k.consumeBySequenceNumber(stream)
+			k.consumeDLQRecord(stream)
 		}
 	}
 }
 
-func (k *Kinesumer) consumeBySequenceNumber(stream string) {
+func (k *Kinesumer) consumeDLQRecord(stream string) {
 	ctx := context.Background()
 
-	shardID, records := k.dlqConsumer(ctx)
+	records, err := k.getDLQRecord(ctx)
 
-	for _, record := range records {
-		k.records <- &Record{
-			Stream:  stream,
-			ShardID: shardID,
-			Record:  record,
+	if err != nil {
+		k.errors <- err
+		return
+	}
+
+	for _, dlqRecord := range records {
+		shardIter, err := k.getNextShardIterator(ctx, stream, dlqRecord.ShardID)
+		if err != nil {
+			k.errors <- errors.WithStack(err)
+			continue
+		}
+
+		output, err := k.client.GetRecordsWithContext(ctx, &kinesis.GetRecordsInput{
+			Limit:         aws.Int64(k.scanLimit),
+			ShardIterator: shardIter,
+		})
+
+		for _, record := range output.Records {
+			k.records <- &Record{
+				Stream:  stream,
+				ShardID: dlqRecord.ShardID,
+				Record:  record,
+			}
 		}
 	}
 }
