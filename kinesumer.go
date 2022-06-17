@@ -34,12 +34,13 @@ const (
 )
 
 type (
-	DLQRecord struct {
+	MissingRecord struct {
+		Stream         string
 		ShardID        string
 		SequenceNumber string
 	}
 
-	GetDLQRecord func(ctx context.Context) ([]DLQRecord, error)
+	GetMissingEventRecord func(ctx context.Context) ([]MissingRecord, error)
 )
 
 // Config defines configs for the Kinesumer client.
@@ -67,7 +68,9 @@ type Config struct {
 	ScanLimit    int64
 	ScanTimeout  time.Duration
 	ScanInterval time.Duration
-	GetDLQRecord GetDLQRecord
+
+	// List of missing record when error consume
+	GetMissingEventRecord GetMissingEventRecord
 }
 
 // Record represents kinesis.Record with stream name.
@@ -151,7 +154,7 @@ type Kinesumer struct {
 	close chan struct{}
 
 	// List of all message failure consume
-	getDLQRecord GetDLQRecord
+	getMissingEventRecord GetMissingEventRecord
 }
 
 // NewKinesumer initializes and returns a new Kinesumer client.
@@ -244,8 +247,8 @@ func NewKinesumer(cfg *Config) (*Kinesumer, error) {
 		kinesumer.efoMeta = make(map[string]*efoMeta)
 	}
 
-	if cfg.GetDLQRecord != nil {
-		kinesumer.getDLQRecord = cfg.GetDLQRecord
+	if cfg.GetMissingEventRecord != nil {
+		kinesumer.getMissingEventRecord = cfg.GetMissingEventRecord
 	}
 
 	if err := kinesumer.init(); err != nil {
@@ -400,6 +403,7 @@ func (k *Kinesumer) start() {
 		k.consumePolling()
 	}
 
+	k.consumeMissingRecord()
 }
 
 func (k *Kinesumer) pause() {
@@ -536,7 +540,6 @@ func (k *Kinesumer) consumePolling() {
 		for _, shard := range shardsPerStream {
 			k.wait.Add(1)
 			go k.consumeLoop(stream, shard)
-			go k.consumeDLQ(stream)
 		}
 	}
 }
@@ -561,10 +564,29 @@ func (k *Kinesumer) consumeLoop(stream string, shard *Shard) {
 	}
 }
 
-func (k *Kinesumer) consumeDLQ(stream string) {
-	defer k.wait.Done()
+/*
 
-	// ticker := time.NewTicker(k.scanInterval)
+Shared consumer Missing Event Record
+
+*/
+
+func (k *Kinesumer) consumeMissingRecord() {
+	ctx := context.Background()
+	records, err := k.getMissingEventRecord(ctx)
+
+	if err != nil {
+		k.errors <- err
+		return
+	}
+
+	for _, record := range records {
+		k.wait.Add(1)
+		go k.consumeLoopMissingRecord(record.Stream, record.ShardID, record.SequenceNumber)
+	}
+}
+
+func (k *Kinesumer) consumeLoopMissingRecord(stream string, shardID string, sequence string) {
+	defer k.wait.Done()
 
 	for {
 		select {
@@ -574,41 +596,40 @@ func (k *Kinesumer) consumeDLQ(stream string) {
 			return
 		default:
 			time.Sleep(k.scanInterval)
-			k.consumeDLQRecord(stream)
+			k.consumeBySequence(stream, shardID, sequence)
 		}
 	}
 }
 
-func (k *Kinesumer) consumeDLQRecord(stream string) {
+func (k *Kinesumer) consumeBySequence(stream string, shardID string, sequence string) bool {
 	ctx := context.Background()
 
-	records, err := k.getDLQRecord(ctx)
+	shardIter, err := k.getNextShardIteratorBySequence(ctx, stream, shardID, sequence)
+	if err != nil {
+		k.errors <- errors.WithStack(err)
+		var riue *kinesis.ResourceInUseException
+		return errors.As(err, &riue)
+	}
+
+	output, err := k.client.GetRecordsWithContext(ctx, &kinesis.GetRecordsInput{
+		Limit:         aws.Int64(k.scanLimit),
+		ShardIterator: shardIter,
+	})
 
 	if err != nil {
-		k.errors <- err
-		return
+		k.errors <- errors.WithStack(err)
+		return false
 	}
 
-	for _, dlqRecord := range records {
-		shardIter, err := k.getNextShardIterator(ctx, stream, dlqRecord.ShardID)
-		if err != nil {
-			k.errors <- errors.WithStack(err)
-			continue
-		}
-
-		output, err := k.client.GetRecordsWithContext(ctx, &kinesis.GetRecordsInput{
-			Limit:         aws.Int64(k.scanLimit),
-			ShardIterator: shardIter,
-		})
-
-		for _, record := range output.Records {
-			k.records <- &Record{
-				Stream:  stream,
-				ShardID: dlqRecord.ShardID,
-				Record:  record,
-			}
+	for _, record := range output.Records {
+		k.records <- &Record{
+			Stream:  stream,
+			ShardID: shardID,
+			Record:  record,
 		}
 	}
+
+	return false
 }
 
 // It returns a flag whether if shard is CLOSED state and has no remaining data.
@@ -675,6 +696,33 @@ func (k *Kinesumer) consumeOnce(stream string, shard *Shard) bool {
 	}
 	k.checkPoints[stream].Store(shard.ID, lastSequence)
 	return false
+}
+
+func (k *Kinesumer) getNextShardIteratorBySequence(
+	ctx context.Context,
+	stream,
+	shardID string,
+	sequence string,
+) (*string, error) {
+
+	if iter, ok := k.nextIters[stream].Load(shardID); ok {
+		return iter.(*string), nil
+	}
+
+	input := &kinesis.GetShardIteratorInput{
+		StreamName:             aws.String(stream),
+		ShardId:                aws.String(shardID),
+		StartingSequenceNumber: aws.String(sequence),
+		ShardIteratorType:      aws.String(kinesis.ShardIteratorTypeAtSequenceNumber),
+	}
+
+	output, err := k.client.GetShardIteratorWithContext(ctx, input)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return output.ShardIterator, nil
 }
 
 func (k *Kinesumer) getNextShardIterator(
