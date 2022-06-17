@@ -75,8 +75,9 @@ type Config struct {
 
 // Record represents kinesis.Record with stream name.
 type Record struct {
-	Stream  string
-	ShardID string
+	Stream         string
+	ShardID        string
+	IsRetryConsume bool
 	*kinesis.Record
 }
 
@@ -623,9 +624,10 @@ func (k *Kinesumer) consumeBySequence(stream string, shardID string, sequence st
 
 	for _, record := range output.Records {
 		k.records <- &Record{
-			Stream:  stream,
-			ShardID: shardID,
-			Record:  record,
+			Stream:         stream,
+			ShardID:        shardID,
+			Record:         record,
+			IsRetryConsume: true,
 		}
 	}
 
